@@ -8,7 +8,7 @@ from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Query
 
-from . import __version__, config
+from . import __version__, config, models
 from .db import Database
 from .models import BuildCreate, BuildOut, CancelOut, LogOut, StepOut
 from .scheduler import Scheduler
@@ -39,6 +39,7 @@ async def _build_out(build_id: int) -> BuildOut:
     return BuildOut(
         id=row["id"],
         name=row["name"],
+        priority=row["priority"],
         status=row["status"],
         cancel_requested=bool(row["cancel_requested"]),
         created_at=row["created_at"],
@@ -51,12 +52,14 @@ async def _build_out(build_id: int) -> BuildOut:
 
 @contextlib.asynccontextmanager
 async def lifespan(app: FastAPI):
-    # 顺序不可颠倒：先落库连接，再清空旧构建残留并标记中断，最后才对外服务
+    # 顺序不可颠倒：先落库连接，再清空旧构建残留并标记中断，最后启动中央调度并对外服务
     await db.connect()
     app.state.recovery = await scheduler.recover()
+    await scheduler.start()
     try:
         yield
     finally:
+        await scheduler.shutdown()
         await db.close()
 
 
@@ -65,8 +68,11 @@ app = FastAPI(
     version=__version__,
     description=(
         "接收最多 12 步的 JSON DAG，在挂载工作目录中执行真实命令；"
-        "全局最多两步并行，依赖全成功才启动，失败后代跳过，"
-        "超时/取消终止整个进程组，支持逐步状态与日志查询。"
+        "提交时可标记 priority=normal（普通构建）或 urgent（紧急补丁）；"
+        "全局两个名额由中央调度器跨构建统一分配，依赖全成功才启动，"
+        "紧急优先但连续两次紧急后须让给就绪的普通步骤，同优先级按构建轮流，"
+        "不抢占已运行步骤，失败后代跳过，超时/取消终止整个进程组，"
+        "支持逐步状态与日志查询。"
     ),
     lifespan=lifespan,
 )
@@ -79,6 +85,7 @@ async def health() -> dict:
         "version": __version__,
         "max_steps": config.MAX_STEPS,
         "max_parallel": config.MAX_PARALLEL,
+        "priorities": list(models.PRIORITIES),
         "recovery": getattr(app.state, "recovery", None),
     }
 

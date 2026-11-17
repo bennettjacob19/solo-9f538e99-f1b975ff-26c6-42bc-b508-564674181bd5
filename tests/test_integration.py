@@ -5,7 +5,6 @@
 """
 from __future__ import annotations
 
-import json
 import os
 import signal
 import socket
@@ -108,6 +107,14 @@ def server(tmp_path_factory):
 def step(uid, command, deps=None, timeout=30.0):
     return {"id": uid, "command": command, "depends_on": deps or [],
             "timeout_seconds": timeout}
+
+
+def submit_pri(client: httpx.Client, name: str, steps: list[dict], priority: str) -> int:
+    r = client.post("/builds", json={"name": name, "priority": priority, "steps": steps})
+    assert r.status_code == 201, r.text
+    body = r.json()
+    assert body["priority"] == priority
+    return body["id"]
 
 
 def submit(client: httpx.Client, name: str, steps: list[dict]) -> int:
@@ -374,7 +381,163 @@ def _step_pid(data_dir: Path, build_id: int, step_uid: str) -> int:
         conn.close()
 
 
-# --------------------------------------------------------------- 9. 其他接口
+# --------------------------------- 8b. 跨构建调度：紧急优先与轮流（端到端）
+
+def _wait_step_running(client, build_id: int, uid: str, timeout: float = 10) -> None:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        sm = step_map(client.get(f"/builds/{build_id}").json())
+        if sm[uid]["status"] in ("running", "cleaning_up"):
+            return
+        time.sleep(0.05)
+    raise AssertionError(f"build={build_id} step={uid} 未在 {timeout}s 内启动")
+
+
+def _started_at(client, build_id: int, uid: str) -> str:
+    sm = step_map(client.get(f"/builds/{build_id}").json())
+    assert sm[uid]["started_at"], f"step {uid} 从未启动"
+    return sm[uid]["started_at"]
+
+
+def test_urgent_patch_jumps_ahead_of_queued_normal_builds(server):
+    # 普通构建的两个慢步骤先占满两个名额；紧急补丁与另一个普通构建随后排队，
+    # 名额释放后紧急补丁必须插队先启动
+    normal = submit_pri(server.client, "normal-big", [
+        step("n1", "sleep 2.5"),
+        step("n2", "sleep 2.5"),
+    ], "normal")
+    _wait_step_running(server.client, normal, "n1")
+    _wait_step_running(server.client, normal, "n2")
+
+    urgent = submit_pri(server.client, "urgent-patch", [
+        step("hot", "echo hotfix"),
+    ], "urgent")
+    queued_normal = submit_pri(server.client, "normal-queued", [
+        step("q", "echo queued"),
+    ], "normal")
+    # 两者在名额释放前都保持排队
+    time.sleep(0.5)
+    assert step_map(server.client.get(f"/builds/{urgent}").json())["hot"]["status"] == "pending"
+    assert step_map(server.client.get(f"/builds/{queued_normal}").json())["q"]["status"] == "pending"
+
+    wait_build(server.client, urgent, timeout=20)
+    wait_build(server.client, queued_normal, timeout=20)
+    wait_build(server.client, normal, timeout=20)
+    # 名额一释放：紧急步骤先于排队普通步骤启动
+    assert _started_at(server.client, urgent, "hot") < _started_at(
+        server.client, queued_normal, "q"
+    )
+    assert step_map(server.client.get(f"/builds/{urgent}").json())["hot"]["status"] == "succeeded"
+
+
+def test_consecutive_two_urgent_then_normal_gets_next_slot(server):
+    # 两个名额先被两个普通慢步骤占住；随后提交 3 个紧急构建 + 1 个普通构建
+    holders = submit_pri(server.client, "holders", [
+        step("h1", "sleep 2.5"),
+        step("h2", "sleep 2.5"),
+    ], "normal")
+    _wait_step_running(server.client, holders, "h1")
+    _wait_step_running(server.client, holders, "h2")
+
+    u1 = submit_pri(server.client, "u1", [step("s", "sleep 0.6")], "urgent")
+    u2 = submit_pri(server.client, "u2", [step("s", "sleep 0.6")], "urgent")
+    u3 = submit_pri(server.client, "u3", [step("s", "sleep 0.6")], "urgent")
+    nq = submit_pri(server.client, "normal-queued", [step("s", "sleep 0.4")], "normal")
+
+    for bid in (holders, u1, u2, u3, nq):
+        wait_build(server.client, bid, timeout=30)
+
+    t_u1 = _started_at(server.client, u1, "s")
+    t_u2 = _started_at(server.client, u2, "s")
+    t_nq = _started_at(server.client, nq, "s")
+    t_u3 = _started_at(server.client, u3, "s")
+    # 前两次释放给紧急（u1、u2），第三次必须让给普通 nq，u3 排在普通之后
+    assert t_u1 < t_u2 < t_nq < t_u3
+
+
+def test_same_priority_builds_take_turns_no_single_build_fills_queue(server):
+    # 跨构建轮流的确定性验证：
+    # 构建 X、Y 的两个闸门步骤先占住两个名额；此时构建 A、B 各有两个就绪步骤
+    # 在全局待选池排队（共 4 个）。释放 X、Y 后，两个名额必须分给 A、B 各一个，
+    # 而不是被任一构建连拿两个 —— 证明同优先级按构建轮流、单构建无法占满队列。
+    gate = server.data_dir / "rr-gate"
+    if gate.exists():
+        gate.unlink()
+
+    def hold() -> str:
+        return (
+            f"for i in $(seq 1 400); do test -f {gate} && exit 0; "
+            "sleep 0.05; done; exit 1"
+        )
+
+    bX = submit_pri(server.client, "rr-holder-X", [step("x", hold())], "normal")
+    bY = submit_pri(server.client, "rr-holder-Y", [step("y", hold())], "normal")
+    _wait_step_running(server.client, bX, "x")
+    _wait_step_running(server.client, bY, "y")
+
+    # 名额已满，A、B 的步骤全部排队
+    bA = submit_pri(server.client, "rr-A", [
+        step("a1", "sleep 0.3"), step("a2", "sleep 0.3"),
+    ], "normal")
+    bB = submit_pri(server.client, "rr-B", [
+        step("b1", "sleep 0.3"), step("b2", "sleep 0.3"),
+    ], "normal")
+    time.sleep(0.4)
+    for bid in (bA, bB):
+        sm = step_map(server.client.get(f"/builds/{bid}").json())
+        assert all(st["status"] == "pending" for st in sm.values())
+
+    gate.write_text("go")  # 同时释放两个名额，调度器在 A、B 间轮转
+    # 两个名额应分别落到 A、B（不同构建），而不是同一个构建连拿
+    deadline = time.time() + 10
+    first_wave: dict[int, str] = {}
+    while time.time() < deadline:
+        for bid in (bA, bB):
+            sm = step_map(server.client.get(f"/builds/{bid}").json())
+            for uid, st in sm.items():
+                if st["status"] in ("running", "cleaning_up", "succeeded"):
+                    first_wave.setdefault(bid, uid)
+        if len(first_wave) == 2:
+            break
+        time.sleep(0.05)
+    assert set(first_wave) == {bA, bB}  # 第一波两个名额分属 A、B 两个构建
+
+    for bid in (bX, bY, bA, bB):
+        detail = wait_build(server.client, bid, timeout=30)
+        assert detail["status"] == "succeeded"
+    # 每个构建的两个步骤都真实执行且各自只执行一次
+    for bid in (bA, bB):
+        sm = step_map(server.client.get(f"/builds/{bid}").json())
+        assert sorted(sm) and all(st["status"] == "succeeded" for st in sm.values())
+
+
+def test_cancelled_build_queued_steps_never_start(server):
+    # 两个慢步骤占满名额，第三个步骤排队；取消构建后排队步骤不得启动
+    bid = submit_pri(server.client, "cancel-queued", [
+        step("a", "sleep 2"),
+        step("b", "sleep 2"),
+        step("c", "echo never-run", ["a"]),
+    ], "normal")
+    _wait_step_running(server.client, bid, "a")
+    _wait_step_running(server.client, bid, "b")
+
+    r = server.client.post(f"/builds/{bid}/cancel")
+    assert r.status_code == 200
+    detail = wait_build(server.client, bid, timeout=20)
+    sm = step_map(detail)
+    assert detail["status"] == "cancelled"
+    assert sm["c"]["status"] == "cancelled"
+    log = server.client.get(f"/builds/{bid}/steps/c/logs").json()
+    assert "never-run" not in command_output(log)
+    # 取消后再提交普通构建，两个名额应能正常释放并服务新构建（不泄漏名额）
+    after = submit_pri(server.client, "after-cancel", [
+        step("z", "echo slot-released"),
+    ], "normal")
+    after_detail = wait_build(server.client, after, timeout=15)
+    assert after_detail["status"] == "succeeded"
+
+
+# --------------------------------------- 9. 其他接口
 
 def test_404_and_bad_payloads(server):
     assert server.client.get("/builds/999999").status_code == 404
@@ -392,6 +555,17 @@ def test_404_and_bad_payloads(server):
 
     empty = {"name": "empty", "steps": []}
     assert server.client.post("/builds", json=empty).status_code == 422
+
+    bad_priority = {"name": "bad-pri", "priority": "critical",
+                    "steps": [step("a", "true")]}
+    r = server.client.post("/builds", json=bad_priority)
+    assert r.status_code == 422
+
+    # 合法优先级被接受且回显
+    ok = server.client.post("/builds", json={
+        "name": "pri-ok", "priority": "urgent", "steps": [step("a", "true")]
+    })
+    assert ok.status_code == 201 and ok.json()["priority"] == "urgent"
 
 
 def test_health_and_docs(server):

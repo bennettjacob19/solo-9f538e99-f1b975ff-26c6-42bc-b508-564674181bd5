@@ -15,7 +15,12 @@ from pathlib import Path
 import httpx
 
 TERMINAL = {"succeeded", "failed", "cancelled", "interrupted"}
-EXAMPLES = ["success_build.json", "failure_build.json", "slow_child_build.json"]
+EXAMPLES = [
+    "success_build.json",
+    "failure_build.json",
+    "slow_child_build.json",
+    "urgent_patch_build.json",
+]
 
 
 def main(base_url: str) -> int:
@@ -23,7 +28,7 @@ def main(base_url: str) -> int:
     with httpx.Client(base_url=base_url, timeout=30) as client:
         for name in EXAMPLES:
             payload = json.loads((examples_dir / name).read_text(encoding="utf-8"))
-            print(f"\n=== 提交示例 {name} ({payload['name']}) ===")
+            print(f"\n=== 提交示例 {name} ({payload['name']}, priority={payload.get('priority', 'normal')}) ===")
             resp = client.post("/builds", json=payload)
             resp.raise_for_status()
             build_id = resp.json()["id"]

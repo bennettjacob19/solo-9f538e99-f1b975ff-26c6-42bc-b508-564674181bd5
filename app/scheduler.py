@@ -1,24 +1,37 @@
-"""流水线调度器。
+"""跨构建流水线调度器。
 
-并发模型：
-- 全局 ``asyncio.Semaphore(2)`` 即"两个名额"，名额在整个步骤生命周期内持有，
-  包含进程组清理阶段 —— 组未清空前不释放名额、不写步骤终态。
+并发模型（v2：跨构建统一调度）：
+- 两个全局名额由中央调度器 ``_dispatch_loop`` 统一管理，名额在整个步骤生命周期内
+  持有，包含进程组清理阶段 —— 组未清空前不释放名额、不写步骤终态。
+- 每个构建一个 asyncio 任务推进自己的 DAG：依赖全部 succeeded 的待运行步骤进入
+  全局"待选池" ``_ready``；构建任务不再自行抢名额，因此单个构建不可能提前占满
+  等待队列。
+- 每次名额真正释放（步骤任务结束回调）后唤醒调度器，只从待选池中选取一次：
+  1. 已取消构建的排队步骤不得启动（直接剔除）；
+  2. 紧急优先；连续两次分给紧急后，若有普通步骤就绪，下一次必须给普通；
+  3. 同优先级内不同构建按提交顺序轮流取得名额，同一构建不能连续拿走名额；
+  4. 同构建内多个就绪步骤按进入待选池的先后（seq）排序。
+- 不抢占已运行步骤：调度只决定"下一个启动谁"，运行中的步骤跑到终态才释放名额。
 - 慢清理只占住自己的名额，不阻塞另一名额上的独立步骤/构建。
-- 每个构建一个 asyncio 任务，轮询 DAG 状态推进；每个运行中的步骤一个子任务，
-  通过 per-build cancel event 实现整次取消的即时响应。
 """
 from __future__ import annotations
 
 import asyncio
 import json
 import os
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
 from . import config, proc
 from .db import Database
-from .models import BUILD_TERMINAL, BuildCreate, validate_dag
+from .models import (
+    BUILD_TERMINAL,
+    STEP_TERMINAL,
+    BuildCreate,
+    validate_dag,
+)
 
 _STEP_FAIL_STATES = {"failed", "skipped", "cancelled", "interrupted"}
 
@@ -27,18 +40,73 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+@dataclass(slots=True)
+class _ReadyEntry:
+    """待选池条目：依赖已全部成功、等待全局名额的步骤。"""
+
+    build_id: int
+    uid: str
+    step_pk: int
+    priority: str
+    seq: int  # 进入待选池的全局先后序号
+    row: Any = field(repr=False)
+
+
 class Scheduler:
     def __init__(self, db: Database) -> None:
         self.db = db
-        self._slots = asyncio.Semaphore(config.MAX_PARALLEL)
         self._build_events: dict[int, asyncio.Event] = {}
         self._build_tasks: dict[int, asyncio.Task[None]] = {}
 
+        # ---- 中央调度状态（全部只在事件循环线程内读写，无需加锁）----
+        self._ready: dict[tuple[int, str], _ReadyEntry] = {}
+        self._inflight: dict[asyncio.Task[str], _ReadyEntry] = {}
+        self._free_slots = config.MAX_PARALLEL
+        self._wake_event = asyncio.Event()
+        self._dispatcher_task: Optional[asyncio.Task[None]] = None
+        self._stopping = False
+        # 公平性账本
+        self._seq_counter = 0
+        self._urgent_streak = 0  # 连续分给紧急的次数（上限 2）
+        # 每个优先级层一个轮转游标：同优先级内不同构建按 id（提交顺序）循环轮流，
+        # 单个构建不能连续拿走名额；游标只记录"上一个被服务的构建"。
+        self._last_build_by_priority: dict[str, Optional[int]] = {
+            "normal": None,
+            "urgent": None,
+        }
+        # 仍有未完成步骤的构建 id（按提交顺序）。轮转在"有活的构建"之间进行，
+        # 而不是只看当前已入池条目：否则先跑完一轮主循环的构建会在其他构建
+        # 入池前连拿多个名额，破坏跨构建轮流。
+        self._active_builds: set[int] = set()
+
     # ------------------------------------------------------------------ API
+
+    async def start(self) -> None:
+        """恢复完成后调用：启动中央调度循环。"""
+        if self._dispatcher_task is None:
+            self._dispatcher_task = asyncio.create_task(
+                self._dispatch_loop(), name="central-dispatcher"
+            )
+
+    async def shutdown(self) -> None:
+        """进程关闭：停止调度并收尾构建任务；在途进程交由下次启动的恢复逻辑处理。"""
+        self._stopping = True
+        self._wake_event.set()
+        tasks: list[asyncio.Task[Any]] = []
+        if self._dispatcher_task is not None:
+            self._dispatcher_task.cancel()
+            tasks.append(self._dispatcher_task)
+        tasks.extend(self._build_tasks.values())
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     async def submit(self, payload: BuildCreate) -> int:
         validate_dag(payload.steps)  # ValueError 由路由层转 400
-        build_id = await self.db.create_build(payload.name, _now())
+        build_id = await self.db.create_build(
+            payload.name, payload.priority, _now()
+        )
         log_dir = config.LOG_ROOT / str(build_id)
         log_dir.mkdir(parents=True, exist_ok=True)
         for step in payload.steps:
@@ -52,9 +120,13 @@ class Scheduler:
                 step.timeout_seconds,
                 str(log_path),
             )
+        # 在创建构建任务前登记为活跃构建：保证中央调度器在任何时刻看到的
+        # 活跃集合都包含已提交构建，跨构建轮转会为尚未入池的构建保留次序
+        self._active_builds.add(build_id)
         task = asyncio.create_task(self._run_build(build_id), name=f"build-{build_id}")
         self._build_tasks[build_id] = task
         task.add_done_callback(self._log_task_exception)
+        self._wakeup()
         return build_id
 
     async def cancel(self, build_id: int) -> tuple[Optional[dict[str, Any]], str]:
@@ -68,6 +140,8 @@ class Scheduler:
         event = self._build_events.get(build_id)
         if event is not None:
             event.set()
+        # 立即唤醒：调度器需剔除该构建的排队步骤，名额让给其他构建
+        self._wakeup()
         return dict(row), "取消请求已受理，运行中的步骤将终止整个进程组"
 
     # ------------------------------------------------------------- 重启恢复
@@ -144,37 +218,165 @@ class Scheduler:
             )
         return {"builds": len(stale), "killed_groups": killed_groups}
 
+    # ------------------------------------------------------------- 中央调度
+
+    def _wakeup(self) -> None:
+        self._wake_event.set()
+
+    def _enqueue(self, build_id: int, uid: str, step_pk: int, priority: str, row: Any) -> None:
+        """依赖已成功的待运行步骤进入全局待选池（幂等）。"""
+        key = (build_id, uid)
+        if key in self._ready:
+            return
+        self._seq_counter += 1
+        self._ready[key] = _ReadyEntry(
+            build_id=build_id,
+            uid=uid,
+            step_pk=step_pk,
+            priority=priority,
+            seq=self._seq_counter,
+            row=row,
+        )
+        self._wakeup()
+
+    def _remove_build_entries(self, build_id: int) -> None:
+        """构建结束/取消时，剔除其仍在排队、尚未启动的步骤。"""
+        for key in [k for k in self._ready if k[0] == build_id]:
+            self._ready.pop(key, None)
+
+    def _is_cancelled(self, build_id: int) -> bool:
+        event = self._build_events.get(build_id)
+        return event is not None and event.is_set()
+
+    def _choose(self) -> Optional[_ReadyEntry]:
+        """策略 + 公平性记账：选出下一个获得名额的步骤并推进轮转游标。
+
+        规则见模块 docstring。候选不足时返回 None（不改动账本）。
+        注意：本方法有副作用——选中即更新该优先级层的轮转游标与紧急连计，
+        因此同一唤醒周期内连续选取多个名额时，后续选取会看到更新后的账本；
+        调用方负责把选中条目从待选池移除并真正分配名额。
+        """
+        candidates = [
+            e for e in self._ready.values() if not self._is_cancelled(e.build_id)
+        ]
+        if not candidates:
+            return None
+
+        normal_ready = [e for e in candidates if e.priority == "normal"]
+        urgent_ready = [e for e in candidates if e.priority == "urgent"]
+
+        # 连续两次紧急后，普通就绪则下一次强制普通（防普通饥饿）
+        force_normal = self._urgent_streak >= 2 and bool(normal_ready)
+        tier = "normal" if force_normal else ("urgent" if urgent_ready else "normal")
+        pool = normal_ready if tier == "normal" else urgent_ready
+
+        # 同优先级跨构建轮流：在该层轮转游标之后取下一个"有活"的构建
+        # （构建 id 即提交顺序），绕回头部。参与轮转的是仍有未完成步骤的
+        # 活跃构建集合，而不仅是当前已入池条目，避免先入池的构建在其他构建
+        # 入池前连拿多个名额；最终仍必须落到本层确有就绪步骤的构建。
+        cursor = self._last_build_by_priority[tier]
+        active_sorted = sorted(self._active_builds)
+        ahead = [bid for bid in active_sorted if cursor is None or bid > cursor]
+        rotation = ahead + [bid for bid in active_sorted if not (cursor is None or bid > cursor)]
+        ready_builds = {e.build_id for e in pool}
+        for chosen_build in rotation:
+            if chosen_build in ready_builds:
+                break
+        else:  # 理论上不会发生：pool 非空则其构建必在活跃集合内
+            return None
+        same_build = [e for e in pool if e.build_id == chosen_build]
+        entry = min(same_build, key=lambda e: e.seq)
+        self._last_build_by_priority[tier] = chosen_build
+        if tier == "urgent":
+            self._urgent_streak += 1
+        else:
+            self._urgent_streak = 0
+        return entry
+
+    async def _dispatch_loop(self) -> None:
+        """名额释放/新步骤入池/取消时唤醒；每轮把空闲名额逐个分出去。"""
+        while not self._stopping:
+            await self._wake_event.wait()
+            self._wake_event.clear()
+            if self._stopping:
+                return
+            # 一个唤醒周期内可能释放多个名额：循环选取直到名额用完或无候选
+            while self._free_slots > 0:
+                entry = self._choose()
+                if entry is None:
+                    break
+                # 二次确认：选取与启动之间构建可能刚被取消。
+                # 显式跳过并 continue（条目已被 _choose 记账但不会占用名额），
+                # 保证循环必然向"无候选"收敛而不会空转。
+                if self._is_cancelled(entry.build_id):
+                    self._ready.pop((entry.build_id, entry.uid), None)
+                    continue
+                self._ready.pop((entry.build_id, entry.uid), None)
+                self._free_slots -= 1
+                task = asyncio.create_task(
+                    self._run_step_guarded(entry),
+                    name=f"build-{entry.build_id}-step-{entry.uid}",
+                )
+                self._inflight[task] = entry
+                task.add_done_callback(self._on_step_done)
+
+    def _on_step_done(self, task: asyncio.Task[str]) -> None:
+        """步骤（含进程组清理与终态落库）结束：名额真正释放，触发下一轮选取。"""
+        entry = self._inflight.pop(task, None)
+        if entry is not None:
+            self._free_slots += 1
+        # 任务异常不应吞掉；_run_step_guarded 已兜底，这里仅留痕
+        if not task.cancelled() and task.exception() is not None:
+            self._log_task_exception(task)
+        self._wakeup()
+
+    async def _run_step_guarded(self, entry: _ReadyEntry) -> str:
+        """步骤任务外壳：启动瞬间再查一次取消，杜绝取消后仍拉起新进程。"""
+        if self._is_cancelled(entry.build_id):
+            await self.db.set_step_status(
+                entry.step_pk,
+                "cancelled",
+                _now(),
+                detail="构建已取消，步骤未启动",
+            )
+            return "cancelled"
+        try:
+            return await self._run_step(entry.build_id, entry.row)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # 兜底：任何意外都落成 failed，不能让名额泄漏
+            self._append_log(
+                entry.row["log_path"], [f"[runner] 步骤任务异常: {exc!r}"]
+            )
+            await self.db.set_step_status(
+                entry.step_pk, "failed", _now(), detail=f"步骤任务异常: {exc}"
+            )
+            return "failed"
+
     # ------------------------------------------------------------- 构建主循环
 
     async def _run_build(self, build_id: int) -> None:
         event = asyncio.Event()
         self._build_events[build_id] = event
-        # (步骤 uid, 步骤任务) 成对保存，避免用任务名反解 uid
-        step_tasks: list[tuple[str, asyncio.Task[str]]] = []
+        # 本构建已进入待选池的步骤，保证幂等入池
+        enqueued: set[str] = set()
         try:
+            build_row = await self.db.get_build(build_id)
+            priority = build_row["priority"] if build_row else "normal"
             await self.db.set_build_status(
                 build_id, "running", _now(), started=True
             )
-            rows = await self.db.get_steps(build_id)
-            statuses = {row["step_uid"]: row["status"] for row in rows}
-            by_id = {row["step_uid"]: row for row in rows}
+            statuses: dict[str, str] = {}
 
             while True:
-                # 先对账：已完成的步骤任务把终态写回内存视图，否则主循环
-                # 会一直看到 "running" 而无法推进/退出
-                for uid, task in step_tasks:
-                    if task.done() and statuses[uid] not in _STEP_FAIL_STATES | {"succeeded"}:
-                        try:
-                            statuses[uid] = task.result()
-                        except Exception as exc:  # 任务异常按失败处理
-                            statuses[uid] = "failed"
-                            self._append_log(
-                                by_id[uid]["log_path"],
-                                [f"[runner] 步骤任务异常: {exc!r}"],
-                            )
+                # 每轮以落库状态为准对账（步骤由中央调度器托管执行）
+                rows = await self.db.get_steps(build_id)
+                by_id = {row["step_uid"]: row for row in rows}
+                statuses = {row["step_uid"]: row["status"] for row in rows}
 
                 # 取消优先：未启动步骤不再启动，运行中的交给步骤任务自行终止
                 if event.is_set():
+                    self._remove_build_entries(build_id)
                     for uid, st in statuses.items():
                         if st == "pending":
                             statuses[uid] = "cancelled"
@@ -188,7 +390,7 @@ class Scheduler:
 
                 progressed = False
                 for uid, row in by_id.items():
-                    if statuses[uid] != "pending":
+                    if statuses[uid] != "pending" or uid in enqueued:
                         continue
                     deps = json.loads(row["depends_on"])
                     dep_st = [statuses[d] for d in deps]
@@ -202,33 +404,30 @@ class Scheduler:
                         )
                         progressed = True
                         continue
-                    # 依赖未全部结束则等下一轮；全部 succeeded 才启动
+                    # 依赖未全部结束则等下一轮；全部 succeeded 才入待选池
                     if any(s != "succeeded" for s in dep_st):
                         continue
-                    task = asyncio.create_task(
-                        self._run_step_with_slot(build_id, row),
-                        name=f"build-{build_id}-step-{uid}",
+                    self._enqueue(
+                        build_id, uid, row["id"], priority, row
                     )
-                    step_tasks.append((uid, task))
-                    statuses[uid] = "running"
+                    enqueued.add(uid)
                     progressed = True
 
-                if all(st in _STEP_FAIL_STATES or st == "succeeded" for st in statuses.values()):
+                if all(
+                    st in STEP_TERMINAL for st in statuses.values()
+                ):
                     break
                 # 没有新推进时睡眠等待；有推进也短暂让出，避免忙等
                 await asyncio.sleep(config.SCHEDULER_TICK if not progressed else 0)
 
-            # 等待所有在途步骤（含进程组清理）落终态后再确认构建终态
-            results = await asyncio.gather(
-                *(task for _, task in step_tasks), return_exceptions=True
-            )
-            for (uid, _), result in zip(step_tasks, results):
-                if isinstance(result, Exception):
-                    statuses[uid] = "failed"
-                else:
-                    statuses[uid] = result
+            # 取消路径下可能仍有在途步骤（dispatcher 托管，含清理）：
+            # 等它们全部落终态后再确认构建终态
+            while True:
+                final_rows = await self.db.get_steps(build_id)
+                if all(r["status"] in STEP_TERMINAL for r in final_rows):
+                    break
+                await asyncio.sleep(config.SCHEDULER_TICK)
 
-            final_rows = await self.db.get_steps(build_id)
             final_statuses = [r["status"] for r in final_rows]
             if "failed" in final_statuses or "interrupted" in final_statuses:
                 final = "failed"
@@ -243,25 +442,12 @@ class Scheduler:
                 build_id, final, _now(), detail=detail, finished=True
             )
         finally:
+            self._remove_build_entries(build_id)
+            self._active_builds.discard(build_id)
             self._build_events.pop(build_id, None)
             self._build_tasks.pop(build_id, None)
 
     # ------------------------------------------------------------- 单步执行
-
-    async def _run_step_with_slot(self, build_id: int, row: Any) -> str:
-        """名额覆盖"启动 -> 运行 -> 进程组完全清空 -> 终态落库"全过程。"""
-        async with self._slots:
-            # 排队期间构建可能已被取消：取消优先，不得再启动新进程
-            event = self._build_events.get(build_id)
-            if event is not None and event.is_set():
-                await self.db.set_step_status(
-                    row["id"],
-                    "cancelled",
-                    _now(),
-                    detail="构建已取消，步骤未启动",
-                )
-                return "cancelled"
-            return await self._run_step(build_id, row)
 
     async def _run_step(self, build_id: int, row: Any) -> str:
         step_pk = row["id"]

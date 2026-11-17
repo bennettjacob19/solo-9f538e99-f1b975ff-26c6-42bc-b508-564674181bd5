@@ -1,0 +1,18 @@
+{
+  "name": "example-urgent-patch",
+  "priority": "urgent",
+  "steps": [
+    {
+      "id": "apply-hotfix",
+      "command": "echo '应用紧急补丁到固件镜像' && echo patch-applied",
+      "depends_on": [],
+      "timeout_seconds": 10
+    },
+    {
+      "id": "verify-hotfix",
+      "command": "echo '快速回归验证紧急补丁' && test patch-applied = patch-applied && echo hotfix-verified",
+      "depends_on": ["apply-hotfix"],
+      "timeout_seconds": 10
+    }
+  ]
+}

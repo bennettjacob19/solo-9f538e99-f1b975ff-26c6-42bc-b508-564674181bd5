@@ -74,6 +74,15 @@ def test_timeout_must_be_positive():
         BuildCreate(name="n", steps=[_step("a", timeout=0)])
 
 
+def test_priority_defaults_to_normal_and_accepts_urgent():
+    default = BuildCreate(name="n", steps=[_step("a")])
+    assert default.priority == "normal"
+    urgent = BuildCreate(name="n", priority="urgent", steps=[_step("a")])
+    assert urgent.priority == "urgent"
+    with pytest.raises(ValidationError):
+        BuildCreate(name="n", priority="critical", steps=[_step("a")])
+
+
 def test_starttime_identity_guard():
     my_pid = os.getpid()
     start = read_starttime(my_pid)

@@ -12,6 +12,7 @@ _SCHEMA = """
 CREATE TABLE IF NOT EXISTS builds (
     id               INTEGER PRIMARY KEY AUTOINCREMENT,
     name             TEXT NOT NULL,
+    priority         TEXT NOT NULL DEFAULT 'normal',
     status           TEXT NOT NULL,
     cancel_requested INTEGER NOT NULL DEFAULT 0,
     detail           TEXT,
@@ -56,6 +57,15 @@ class Database:
         await self._conn.execute("PRAGMA foreign_keys=ON")
         await self._conn.execute("PRAGMA busy_timeout=30000")
         await self._conn.executescript(_SCHEMA)
+        # 旧版本库（v1 无 priority 列）的轻量迁移：补列并回填普通优先级
+        existing_cols = [
+            r[1]
+            for r in await self._conn.execute_fetchall("PRAGMA table_info(builds)")
+        ]
+        if "priority" not in existing_cols:
+            await self._conn.execute(
+                "ALTER TABLE builds ADD COLUMN priority TEXT NOT NULL DEFAULT 'normal'"
+            )
 
     async def close(self) -> None:
         if self._conn is not None:
@@ -79,10 +89,13 @@ class Database:
 
     # ---- 业务封装 -------------------------------------------------------
 
-    async def create_build(self, name: str, now: str) -> int:
+    async def create_build(
+        self, name: str, priority: str, now: str
+    ) -> int:
         return await self.execute(
-            "INSERT INTO builds (name, status, created_at) VALUES (?, 'pending', ?)",
-            (name, now),
+            "INSERT INTO builds (name, priority, status, created_at) "
+            "VALUES (?, ?, 'pending', ?)",
+            (name, priority, now),
         )
 
     async def create_step(

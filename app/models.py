@@ -1,7 +1,7 @@
 """请求/响应模型与 DAG 校验。"""
 from __future__ import annotations
 
-from typing import Annotated, Optional
+from typing import Annotated, Literal, Optional
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -16,6 +16,10 @@ BUILD_TERMINAL = {"succeeded", "failed", "cancelled", "interrupted"}
 # 取消/超时后清理时采用的终态
 CANCEL_TERMINAL = "cancelled"
 TIMEOUT_TERMINAL = "failed"
+
+# 构建优先级：普通构建 / 紧急补丁
+PRIORITIES = ("normal", "urgent")
+PRIORITY_RANK = {"normal": 0, "urgent": 1}
 
 
 class StepIn(BaseModel):
@@ -41,6 +45,10 @@ class StepIn(BaseModel):
 
 class BuildCreate(BaseModel):
     name: Annotated[str, Field(min_length=1, max_length=128)]
+    priority: Annotated[
+        Literal["normal", "urgent"],
+        Field(description="normal=普通构建，urgent=紧急补丁，默认 normal"),
+    ] = "normal"
     steps: Annotated[list[StepIn], Field(min_length=1, max_length=config.MAX_STEPS)]
 
 
@@ -59,6 +67,7 @@ class StepOut(BaseModel):
 class BuildOut(BaseModel):
     id: int
     name: str
+    priority: str
     status: str
     cancel_requested: bool
     created_at: str
